@@ -1,0 +1,373 @@
+-- run_on_actor(getactors()[1], readfile("thirdperson.lua"))
+
+local thirdPerson = true -- this might be laggy
+local showCharacter = true
+local showCharacterWhileAiming = false
+local showCharacterAntiAim = true
+local characterUpdateFPS = 0 -- 0 for unlimited
+local cameraOffset = Vector3.new(0, 0, 7)
+local characterAlwaysVisible = true
+local toggleThirdPersonKeybind = "Y"
+
+local antiAim = true
+local yaw = false
+local yawDegrees = 180 -- 0 through 360
+local yawMode = "relative" -- absolute or relative
+local pitch = true
+local pitchDegrees = 0 -- 0 through 180
+local pitchMode = "absolute" -- absolute or relative
+local spinBot = true
+local spinDirection = "right" -- "left" or "right"
+local spinSpeed = 180 -- degrees per second
+local jitter = true
+local jitterSpeed = 6 -- shakes per second
+local forceStance = false
+local setStance = "prone" -- "stand" or "crouch" or "prone"
+
+if unloadThirdPerson then unloadThirdPerson() end
+local shared = getrenv().shared
+local network = shared.require("NetworkClient")
+local screenCull = shared.require("ScreenCull")
+local playerRegistry = shared.require("PlayerRegistry")
+local cameraInterface = shared.require("CameraInterface")
+local replicationObject = shared.require("ReplicationObject")
+local thirdPersonObject = shared.require("ThirdPersonObject")
+local playerClient = shared.require("PlayerDataClientInterface")
+local weaponInterface = shared.require("WeaponControllerInterface")
+local weaponObject = shared.require("WeaponControllerObject")
+
+local players = game:GetService("Players")
+local workspace = game:GetService("Workspace")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local camera = workspace.CurrentCamera
+local ignore = workspace.Ignore
+local player = players.LocalPlayer
+local currentObj, started, fakeRepObject
+
+debug.setupvalue(replicationObject.new, 3, nil)
+fakeRepObject = replicationObject.new(player)
+debug.setupvalue(replicationObject.new, 3, player)
+
+local hidden = false
+userInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode[toggleThirdPersonKeybind] then
+        hidden = not hidden
+    end
+end)
+
+local controlledParts = {}
+local function hookPart(part)
+    if (part:IsA("BasePart") or part:IsA("Decal")) and (part.ClassName ~= "Part" or part.Transparency < 1) then
+        table.insert(controlledParts, part)
+    end
+end
+
+local function hookModel(model)
+    if thirdPerson and showCharacter then
+        for _, part in next, model:GetDescendants() do
+            hookPart(part)
+            part.ChildAdded:Connect(hookPart)
+        end
+
+        model.ChildAdded:Connect(hookPart)
+    end
+end
+
+camera.ChildAdded:Connect(hookModel)
+
+for _, model in next, camera:GetChildren() do
+    hookModel(model)
+end
+
+local function toanglesyx(v)
+	local x, y, z = v.x, v.y, v.z
+	return math.asin(y / (x * x + y * y + z * z) ^ 0.5), math.atan2(-x, -z), 0
+end
+
+local physicsignore = {workspace.Terrain, ignore, workspace.Players, camera}
+local raycastparameters = RaycastParams.new()
+local function raycast(origin, direction, filterlist, whitelist)
+    raycastparameters.IgnoreWater = true
+    raycastparameters.FilterDescendantsInstances = filterlist or physicsignore
+    raycastparameters.FilterType = Enum.RaycastFilterType[whitelist and "Whitelist" or "Blacklist"]
+
+    local result = workspace:Raycast(origin, direction, raycastparameters)
+    return result and result.Instance, result and result.Position, result and result.Normal
+end
+
+local send = network.send
+function network:send(name, ...)
+    if thirdPerson and showCharacter then
+        if name == "spawn" then
+            if not started then
+                started = true
+            end
+        end
+
+        if currentObj then
+            if name == "equip" then
+                local slot = ...
+
+                if slot ~= 3 then
+                    currentObj:equip(slot)
+                else
+                    currentObj:equipMelee()
+                end
+            elseif name == "stab" then
+                currentObj:stab()
+            elseif name == "aim" then
+                local aiming = ...
+                currentObj:setAim(aiming)
+            elseif name == "sprint" then
+                local sprinting = ...
+                currentObj:setSprint(sprinting)
+            elseif name == "stance" then
+                local stance = ...
+
+                if not antiAim or not forceStance or not showCharacterAntiAim then
+                    currentObj:setStance(stance)
+                end
+            elseif name == "newbullets" then
+                currentObj:kickWeapon(nil, nil, nil, 0)
+            end
+        end
+    end
+
+    if antiAim and forceStance and name == "stance" then
+        local stance = ...
+        stance = setStance
+
+        if showCharacterAntiAim then
+            currentObj:setStance(stance)
+        end
+
+        return send(self, name, stance)
+    end
+    
+    return send(self, name, ...)
+end
+
+local startTime = os.clock()
+local pi = math.pi
+local quarter = pi * 0.5
+local rad = math.rad
+local clamp = math.clamp
+local function applyAAAngles(angles)
+    local x, y, z = angles.X, angles.Y, angles.Z
+
+    if pitch then
+        local addition = rad(pitchDegrees) - quarter
+
+        if string.find(string.lower(pitchMode), "abs") then
+            x = addition
+        else
+            x += addition
+        end
+
+        x = clamp(x, -quarter, quarter)
+    end
+
+    if yaw then
+        local addition = rad(yawDegrees)
+
+        if string.find(string.lower(yawMode), "abs") then
+            y = addition
+        else
+            y += addition
+        end
+    end
+
+    if spinBot then
+        y += (os.clock() - startTime) * math.rad(spinSpeed) * ((spinDirection == "right" and -1) or 1)
+    end
+
+    return Vector3.new(x, y, z)
+end
+
+local gamemetatable = getrawmetatable(game)
+local __namecall = gamemetatable.__namecall
+setreadonly(gamemetatable, false)
+gamemetatable.__namecall = function(self, ...)
+    if self.Name == "UnreliableRemoteEvent" then
+        local method = getnamecallmethod()
+            
+        if method == "InvokeServer" or method == "FireServer" then
+            local position, angles, time = ...
+
+            if antiAim then
+                angles = applyAAAngles(angles)
+            end
+            
+            return __namecall(self, position, angles, time)
+        end
+    end
+
+    return __namecall(self, ...)
+end
+
+local preparePickUpFirearm = weaponObject.preparePickUpFirearm
+function weaponObject:preparePickUpFirearm(slot, name, attachments, attData, camoData, magAmmo, spareAmmo, newId, wasClient)
+    local wepData = {
+        Name = name,
+        Attachments = attachments,
+        AttData = addData,
+        Camo = camoData
+    }
+
+    fakeRepObject:swapWeapon(slot, wepData)
+    currentObj:replaceWeapon(slot, wepData)
+    
+    return preparePickUpFirearm(self, slot, name, attachments, attData, camoData, magAmmo, spareAmmo, newId, wasClient)
+end
+
+local preparePickUpMelee = weaponObject.preparePickUpMelee
+function weaponObject:preparePickUpMelee(name, camoData, newId, wasClient)
+    local wepData = {
+        Name = name,
+        Camo = camoData
+    }
+
+    fakeRepObject:swapWeapon(3, wepData)
+    currentObj:replaceWeapon(3, wepData)
+    
+    return preparePickUpMelee(self, name, camoData, newId, wasClient)
+end
+
+local step = screenCull.step
+function screenCull.step(...)
+	step(...)
+    
+    if thirdPerson and not hidden then
+        local controller = weaponInterface.getController()
+
+        if controller and (showCharacterWhileAiming or not controller:getActiveWeapon()._aiming) then
+            local didHit = false
+
+            if characterAlwaysVisible then
+                local oldPosition = camera.CFrame.Position
+                local newPosition = camera.CFrame * cameraOffset
+                local dir = newPosition - oldPosition
+                local hit, position = raycast(oldPosition, dir)
+
+                if hit then
+                    camera.CFrame *= CFrame.new(cameraOffset * ((position - oldPosition).Magnitude / cameraOffset.Magnitude) * 0.99)
+                    didHit = true
+                end
+            end
+
+            if not didHit then
+                camera.CFrame *= CFrame.new(cameraOffset)
+            end
+        end
+    end
+end
+
+local setCharacterRender = thirdPersonObject.setCharacterRender
+function thirdPersonObject:setCharacterRender(render) -- may cause lag but fixes bugs lol
+    return setCharacterRender(self, render or (self._player ~= player and camera:WorldToViewportPoint(self._replicationObject._receivedPosition or self:getRootPart().Position).Z > 0))
+end
+
+local lastJitter = 0
+local lastJitterStarted = false
+local minDeltaTime = characterUpdateFPS == 0 and 0 or 1 / characterUpdateFPS
+local deltaTime = 0
+local lastTime = 0
+local lastPos
+local heartbeat = runService.Heartbeat:Connect(function(ndt)
+    local ref = ignore:FindFirstChild("RefPlayer")
+    local rootPart = ref and ref:FindFirstChild("HumanoidRootPart")
+    local clockTime = os.clock()
+
+    if thirdPerson and showCharacter then
+        deltaTime = deltaTime + ndt
+        local controller = weaponInterface.getController()
+        local aiming = controller and controller:getActiveWeapon()._aiming
+
+        if controller then
+            local parts = {}
+
+            for _, part in next, controlledParts do
+                if part.Parent ~= nil then
+                    part.Transparency = ((hidden or (not showCharacterWhileAiming and aiming)) and not controller:getActiveWeapon()._blackScoped) and 0 or 1
+                    table.insert(parts, part)
+                end
+            end
+
+            controlledParts = parts
+        end
+
+        if clockTime - lastTime > minDeltaTime then
+            if rootPart then
+                local position = rootPart.Position
+                lastPos = lastPos or position
+                local velocity = (position - lastPos) / deltaTime
+                deltaTime = 0
+
+                if currentObj or started then
+                    if started then
+                        local classData = playerClient.getPlayerData().settings.classdata
+                        fakeRepObject:spawn(nil, classData[classData.curclass])
+                        currentObj = fakeRepObject._thirdPersonObject
+
+                        if antiAim and forceStance and showCharacterAntiAim then
+                            currentObj:setStance(setStance)
+                        end
+                    end
+                    
+                    local angles = cameraInterface:getActiveCamera():getAngles()
+                    if antiAim and showCharacterAntiAim then
+                        angles = applyAAAngles(angles)
+                    end
+                    
+                    local tickTime = tick()
+                    fakeRepObject._smoothReplication:receive(clockTime, tickTime, {
+                        t = tickTime,
+                        position = position,
+                        velocity = velocity,
+                        angles = angles,
+                        breakcount = 0
+                    }, false)
+
+                    fakeRepObject._updaterecieved = true
+                    fakeRepObject._receivedPosition = position
+                    fakeRepObject._receivedFrameTime = network.getTime()
+                    fakeRepObject._lastPacketTime = clockTime
+                    fakeRepObject:step(3, true)
+                    lastTime = clockTime
+                    started = false
+
+                    if hidden or (not showCharacterWhileAiming and controller and aiming) then
+                        currentObj:setCharacterRender(false)
+                    end
+                end
+            elseif not started and currentObj then
+                fakeRepObject:despawn()
+                currentObj:Destroy()
+                currentObj = nil
+                lastPos = nil
+            end
+        end
+    end
+
+    if antiAim and jitter and rootPart and (clockTime - lastJitter) > (1 / jitterSpeed / 2) then
+        lastJitterStarted = not lastJitterStarted
+        send(network, "aim", lastJitterStarted)
+        lastJitter = clockTime
+
+        if showCharacterAntiAim then
+            currentObj:setAim(lastJitterStarted)
+        end
+    end
+end)
+
+getgenv().unloadThirdPerson = function()
+    weaponObject.preparePickUpMelee = preparePickUpMelee
+    weaponObject.preparePickUpFirearm = preparePickUpFirearm
+    thirdPersonObject.setCharacterRender = setCharacterRender
+    screenCull.step = step
+    network.send = send
+    heartbeat:Disconnect()
+    gamemetatable.__namecall = __namecall
+    setreadonly(gamemetatable, true)
+end
