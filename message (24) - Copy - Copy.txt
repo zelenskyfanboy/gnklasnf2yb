@@ -1,7 +1,7 @@
 -- run_on_actor(getactors()[1], readfile("thirdperson.lua"))
 
-local thirdPerson = true -- this might be laggy
-local showCharacter = true
+local thirdPerson = false -- this might be laggy
+local showCharacter = false
 local showCharacterWhileAiming = false
 local showCharacterAntiAim = true
 local characterUpdateFPS = 0 -- 0 for unlimited
